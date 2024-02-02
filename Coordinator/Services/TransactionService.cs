@@ -7,10 +7,10 @@ namespace Coordinator.Services
 {
     public class TransactionService(IHttpClientFactory _httpClientFactory, TwoPhaseCommitContext _context) : ITransactionService
     {
-        
+
         HttpClient _orderHttpClient = _httpClientFactory.CreateClient("OrderAPI");
-        HttpClient _stockHttpClient;
-        HttpClient _paymentHttpClient;
+        HttpClient _stockHttpClient = _httpClientFactory.CreateClient("StockAPI");
+        HttpClient _paymentHttpClient = _httpClientFactory.CreateClient("PaymentAPI");
 
         public async Task<Guid> CreateTransactionAsync()
         {
@@ -37,37 +37,86 @@ namespace Coordinator.Services
             {
                 try
                 {
-                    var response = transactionNode.Node.Name switch
+                    var response = await (transactionNode.Node.Name switch
                     {
-                        "Order.API" => "...",
-                        "Stock.API" => "...",
-                        "Payment.API" => "...",
-                    };
+                        "Order.API" => _orderHttpClient.GetAsync("ready"),
+                        "Stock.API" => _stockHttpClient.GetAsync("ready"),
+                        "Payment.API" => _paymentHttpClient.GetAsync("ready")
+                    });
+
+                    var result = bool.Parse(await response.Content.ReadAsStringAsync());
+                    transactionNode.IsReady = result ? Enums.ReadyType.Ready : Enums.ReadyType.NotReady;
                 }
                 catch (Exception)
                 {
-
-                    throw;
+                    transactionNode.IsReady = Enums.ReadyType.NotReady;
                 }
             }
-        }
-        public Task<bool> CheckReadyServicesAsync(Guid transactionId)
-        {
-            throw new NotImplementedException();
-        }
 
-        public Task CommitAsync(Guid transactionId)
-        {
-            throw new NotImplementedException();
+            await _context.SaveChangesAsync();
         }
-        public Task<bool> CheckTransactionStateServicesAsync(Guid transactionId)
+        public async Task<bool> CheckReadyServicesAsync(Guid transactionId)
+            => (await _context.NodeStates
+                .Where(ns => ns.TransactionId == transactionId)
+                .ToListAsync()).TrueForAll(ns => ns.IsReady == Enums.ReadyType.Ready);
+        public async Task CommitAsync(Guid transactionId)
         {
-            throw new NotImplementedException();
-        }
+            var transactionNodes = await _context.NodeStates.Where(ns => ns.TransactionId == transactionId).Include(ns => ns.Node).ToListAsync();
 
-        public Task RollbackAsync(Guid transactionId)
+            foreach (var transactionNode in transactionNodes)
+            {
+                try
+                {
+                    var response = await (transactionNode.Node.Name switch
+                    {
+                        "Order.API" => _orderHttpClient.GetAsync("commit"),
+                        "Stock.API" => _stockHttpClient.GetAsync("commit"),
+                        "Payment.API" => _paymentHttpClient.GetAsync("commit")
+                    });
+
+                    var result = bool.Parse(await response.Content.ReadAsStringAsync());
+                    transactionNode.TransactionState = result ? Enums.TransactionState.Success : Enums.TransactionState.Abort;
+                }
+                catch
+                {
+
+                    transactionNode.TransactionState = Enums.TransactionState.Abort;
+                }
+            }
+            await _context.SaveChangesAsync();
+        }
+        public async Task<bool> CheckTransactionStateServicesAsync(Guid transactionId)
+            => (await _context.NodeStates
+            .Where(ns => ns.TransactionId == transactionId)
+            .ToListAsync()).TrueForAll(ns => ns.TransactionState == Enums.TransactionState.Success);
+
+        public async Task RollbackAsync(Guid transactionId)
         {
-            throw new NotImplementedException();
+            var transactionNodes = await _context.NodeStates
+                .Where(ns => ns.TransactionId == transactionId)
+                .Include(ns => ns.Node)
+                .ToListAsync();
+
+            foreach (var transactionNode in transactionNodes)
+            {
+                try
+                {
+                    if (transactionNode.TransactionState == Enums.TransactionState.Success)
+                        _ = await (transactionNode.Node.Name switch
+                        {
+                            "Order.API" => _orderHttpClient.GetAsync("rollback"),
+                            "Stock.API" => _stockHttpClient.GetAsync("rollback"),
+                            "Payment.API" => _paymentHttpClient.GetAsync("rollback"),
+                        });
+
+                    transactionNode.TransactionState = Enums.TransactionState.Abort;
+                }
+                catch
+                {
+                    transactionNode.TransactionState = Enums.TransactionState.Abort;
+                }
+            }
+            await _context.SaveChangesAsync();
         }
     }
 }
